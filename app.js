@@ -4,6 +4,7 @@ require('dotenv').config();
 const sip = require('sipstel');
 const fs = require('fs');
 const path = require('path');
+const openaiHandler = require('./openai-handler');
 
 const DOMAIN = process.env.SIP_DOMAIN;
 const USER   = process.env.SIP_USER;
@@ -37,7 +38,7 @@ if (!fs.existsSync(SAMPLE_WAV)) {
 }
 
 // Track active players and recorders per call
-const callSessions = new Map(); // Maps call to {player, recorder}
+const callSessions = new Map(); // Maps call to {players, recorder, playbackStarted, recordingFile, conversationHistory, aiSession}
 
 // Create a queue of audio files to play
 const BEETHOVEN_WAV = path.join(__dirname, 'beethoven.wav');
@@ -89,6 +90,14 @@ function setupCallHandlers(call) {
           console.log('\n🧹 CLEANING UP SESSION');
           console.log(`   Players created: ${session.players ? session.players.length : 0}`);
           
+          if (session.conversationHistory && session.conversationHistory.length > 0) {
+            console.log('\n💬 CONVERSATION SUMMARY:');
+            session.conversationHistory.forEach((msg, idx) => {
+              const role = msg.role === 'user' ? '👤 User' : '🤖 AI';
+              console.log(`   ${idx + 1}. ${role}: ${msg.content}`);
+            });
+          }
+          
           if (session.recorder) {
             try {
               console.log('   Stopping recorder...');
@@ -130,9 +139,17 @@ function setupCallHandlers(call) {
           audioQueueIndex: 0,
           players: [],
           recorder: null,
-          playbackStarted: false
+          playbackStarted: false,
+          conversationHistory: [],
+          aiSession: null,
+          recordingBuffer: Buffer.alloc(0)
         };
         callSessions.set(call, session);
+      }
+      
+      // Initialize AI session
+      if (!session.aiSession) {
+        session.aiSession = openaiHandler.initializeRealtimeSession();
       }
       
       // Start playback only once per call
@@ -150,6 +167,7 @@ function setupCallHandlers(call) {
             mediaStream.startTransmitTo(recorder);
             session.recorder = recorder;
             session.recordingFile = recordingFile;
+            console.log(`🎙️  Recording caller audio to: ${recordingFile}`);
           }
         } catch (error) {
           console.error('❌ Error creating recorder:', error.message);
@@ -175,14 +193,8 @@ function getAudioDuration(filePath) {
       dataSize = buffer.readUInt32LE(dataOffset + 4);
     }
     
-    console.log(`   🔍 WAV DEBUG - File: ${path.basename(filePath)}`);
-    console.log(`      sampleRate: ${sampleRate}, channels: ${channels}, bitsPerSample: ${bitsPerSample}`);
-    console.log(`      dataSize: ${dataSize} bytes`);
-    
     const bytesPerSample = (bitsPerSample / 8) * channels;
     const duration = (dataSize / (sampleRate * bytesPerSample)) * 1000;
-    
-    console.log(`      bytesPerSample: ${bytesPerSample}, calculated duration: ${(duration/1000).toFixed(2)}s`);
     
     return Math.ceil(duration);
   } catch (error) {
@@ -201,7 +213,13 @@ function startAudioPlayback(mediaStream, call, session) {
   
   function playNextFile() {
     if (currentIndex >= audioFiles.length) {
-      console.log('✅ ALL FILES PLAYED');
+      console.log('✅ ALL FILES PLAYED - Waiting for caller input...');
+      
+      // After initial greeting, start monitoring for caller input
+      setTimeout(() => {
+        handleCallerInput(mediaStream, call, session);
+      }, 2000);
+      
       return;
     }
     
@@ -217,7 +235,6 @@ function startAudioPlayback(mediaStream, call, session) {
       if (!player) {
         console.error(`❌ Failed to create player for ${filename}`);
         currentIndex++;
-        // Wait 500ms before trying next file
         setTimeout(() => playNextFile(), 500);
         return;
       }
@@ -226,7 +243,6 @@ function startAudioPlayback(mediaStream, call, session) {
       player.startTransmitTo(mediaStream);
       console.log(`   ✅ Playing: ${filename}`);
       
-      // Move to next file after duration + small buffer
       const delayMs = duration + 500;
       currentIndex++;
       
@@ -242,6 +258,68 @@ function startAudioPlayback(mediaStream, call, session) {
   }
   
   playNextFile();
+}
+
+// Handle caller input - process recorded audio with OpenAI
+async function handleCallerInput(mediaStream, call, session) {
+  console.log('\n🎤 AWAITING CALLER INPUT...');
+  console.log('   ⏱️  Listening for caller input (10 seconds)...');
+  
+  // Wait 10 seconds, then process
+  setTimeout(async () => {
+    if (!session.recordingFile || !fs.existsSync(session.recordingFile)) {
+      console.log('   ⚠️  No caller audio recorded');
+      return;
+    }
+    
+    try {
+      // Read the recorded audio
+      const audioBuffer = fs.readFileSync(session.recordingFile);
+      
+      console.log(`   📊 Recorded audio size: ${(audioBuffer.length / 1024).toFixed(1)} KB`);
+      
+      // Process with OpenAI
+      const result = await openaiHandler.processUserAudio(audioBuffer, session.conversationHistory);
+      
+      if (result) {
+        console.log(`\n✅ PROCESSED CALLER INPUT:`);
+        console.log(`   💬 User said: "${result.userMessage}"`);
+        console.log(`   🤖 AI responds: "${result.aiResponse}"`);
+        
+        // Play response back to caller
+        if (result.audioPath && fs.existsSync(result.audioPath)) {
+          console.log(`\n🔊 PLAYING AI RESPONSE AUDIO...`);
+          
+          const responsePlayer = sip.createPlayer(result.audioPath, true);
+          if (responsePlayer) {
+            session.players.push(responsePlayer);
+            responsePlayer.startTransmitTo(mediaStream);
+            
+            const duration = getAudioDuration(result.audioPath);
+            console.log(`   ⏱️  Duration: ${(duration/1000).toFixed(1)}s`);
+            
+            // Clean up audio file after playing
+            setTimeout(() => {
+              openaiHandler.cleanupAudioFile(result.audioPath);
+            }, duration + 500);
+            
+            // Wait for response to finish, then ask for next input
+            setTimeout(() => {
+              console.log('\n✅ Response played - waiting for next input...');
+              handleCallerInput(mediaStream, call, session);
+            }, duration + 1000);
+          }
+        }
+      } else {
+        console.log('   ⚠️  Could not process caller audio');
+        handleCallerInput(mediaStream, call, session);
+      }
+      
+    } catch (error) {
+      console.error('   ❌ Error processing caller input:', error.message);
+      handleCallerInput(mediaStream, call, session);
+    }
+  }, 10000);
 }
 
 // Create SIP account
@@ -295,7 +373,7 @@ setTimeout(() => {
 
 }, 2000);
 
-console.log('✅ SIP server ready...');
+console.log('✅ SIP server ready...\n');
 
 // Graceful shutdown
 process.on('SIGINT', () => {
